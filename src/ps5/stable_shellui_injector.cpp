@@ -90,6 +90,110 @@ std::uintptr_t resolve_remote(pid_t pid, const char* symbol) noexcept {
     return static_cast<std::uintptr_t>(pt_resolve(pid, nid));
 }
 
+using RemoteLoadStartModule = int (*)(
+    const char*,
+    unsigned long,
+    const void*,
+    unsigned int,
+    void*,
+    int*);
+
+struct RemoteLoadModuleArgs {
+    RemoteLoadStartModule load_start_module = nullptr;
+    const char* name = nullptr;
+    int* result = nullptr;
+    int rc = -777;
+};
+
+extern "C" __attribute__((used, noinline, section(".prefbar_loadmod.1")))
+int prefbar_loadmod_stager(RemoteLoadModuleArgs* args) {
+    args->rc = args->load_start_module(
+        args->name, 0, nullptr, 0, nullptr, args->result);
+    asm volatile("int3");
+    return 0;
+}
+
+extern "C" __attribute__((used, noinline, section(".prefbar_loadmod.2")))
+int prefbar_loadmod_stager_end() {
+    return 0;
+}
+
+std::size_t loadmod_stager_size() noexcept {
+    const auto begin =
+        reinterpret_cast<std::uintptr_t>(&prefbar_loadmod_stager);
+    const auto end =
+        reinterpret_cast<std::uintptr_t>(&prefbar_loadmod_stager_end);
+    return end > begin ? static_cast<std::size_t>(end - begin) : 0;
+}
+
+bool ensure_hidcontrol_loaded(pid_t pid) noexcept {
+    uint32_t handle = 0;
+    if (kernel_dynlib_handle(pid, "libSceHidControl.sprx", &handle) == 0 &&
+        handle != 0) {
+        return true;
+    }
+
+    const std::uintptr_t load_start_module =
+        resolve_remote(pid, "sceKernelLoadStartModule");
+    if (load_start_module == 0)
+        return false;
+
+    const char name[] = "libSceHidControl.sprx";
+    const intptr_t remote_name = pt_mmap(
+        pid, 0, sizeof(name), PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (remote_name <= 0 || pt_copyin(pid, name, remote_name, sizeof(name)) != 0)
+        return false;
+
+    const intptr_t remote_result = pt_mmap(
+        pid, 0, sizeof(int), PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    int zero = 0;
+    if (remote_result <= 0 ||
+        pt_copyin(pid, &zero, remote_result, sizeof(zero)) != 0) {
+        return false;
+    }
+
+    const std::size_t code_size = loadmod_stager_size();
+    const intptr_t remote_stager = pt_mmap(
+        pid, 0, code_size, PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (remote_stager <= 0 || code_size == 0 ||
+        kernel_mprotect(pid, remote_stager, code_size,
+                        PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+        pt_copyin(pid, reinterpret_cast<const void*>(&prefbar_loadmod_stager),
+                  remote_stager, code_size) != 0) {
+        return false;
+    }
+
+    RemoteLoadModuleArgs args{};
+    args.load_start_module =
+        reinterpret_cast<RemoteLoadStartModule>(load_start_module);
+    args.name = reinterpret_cast<const char*>(remote_name);
+    args.result = reinterpret_cast<int*>(remote_result);
+
+    const intptr_t remote_args = pt_mmap(
+        pid, 0, sizeof(args), PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (remote_args <= 0 || pt_copyin(pid, &args, remote_args, sizeof(args)) != 0)
+        return false;
+
+    (void)call_until_breakpoint_on_target_stack(
+        pid,
+        static_cast<std::uintptr_t>(remote_stager),
+        static_cast<std::uint64_t>(remote_args));
+
+    RemoteLoadModuleArgs readback{};
+    if (pt_copyout(pid, remote_args, &readback, sizeof(readback)) != 0 ||
+        readback.rc <= 0) {
+        return false;
+    }
+
+    handle = 0;
+    return kernel_dynlib_handle(pid, "libSceHidControl.sprx", &handle) == 0 &&
+        handle != 0;
+}
+
 } // namespace
 
 StableInjectionResult inject_shellui_stable(
@@ -114,6 +218,8 @@ StableInjectionResult inject_shellui_stable(
         result.attached = true;
 
         do {
+            (void)ensure_hidcontrol_loaded(shellui_pid);
+
             const std::uintptr_t pthread_create =
                 resolve_remote(shellui_pid, "pthread_create");
             if (pthread_create == 0)

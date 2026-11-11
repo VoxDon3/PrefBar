@@ -62,6 +62,7 @@ static const char* const g_resolve_libraries[] = {
     "libSceSysmodule.sprx",
     "libSceUserService.sprx",
     "libScePad.sprx",
+    "libSceHidControl.sprx",
 };
 
 static int prefbar_trace_continue(pid_t pid) {

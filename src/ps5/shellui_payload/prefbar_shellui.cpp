@@ -18,6 +18,8 @@ int scePadClose(int handle);
 int scePadGetHandle(int user_id, int type, int index);
 int scePadReadState(int handle, void* data);
 int sceUserServiceGetForegroundUser(int* user_id);
+int scePadGetDeviceId(int handle, unsigned int* id);
+int sceHidControlGetBatteryState(int device_id, void* state) __attribute__((weak));
 }
 
 #include <arpa/inet.h>
@@ -38,6 +40,8 @@ int sceUserServiceGetForegroundUser(int* user_id);
 namespace prefbar::ps5::shellui {
 
 namespace {
+
+#include "battery_assets.c"
 
 static_assert(SOL_SOCKET == 0xffff);
 static_assert(SO_RCVTIMEO == 0x1006);
@@ -178,6 +182,62 @@ struct TelemetryLayout {
 TelemetryLayout g_telemetry_layout{};
 std::atomic<bool> g_telemetry_draw_busy{false};   /* the draw routine must never run twice at once */
 int g_row_rebuild_count = 0;
+
+constexpr const char* kBatteryPanelId = "id_prefbar_battery_panel";
+constexpr const char* kBatteryBodyId = "id_prefbar_battery_body";
+constexpr const char* kBatteryBodyRedId = "id_prefbar_battery_body_red";
+constexpr const char* kBatteryLabelId = "id_prefbar_battery_label";
+constexpr const char* kBatterySegColor[1] = {
+    "blue"
+};
+constexpr float kBatteryPanelX = 1660.0f;
+constexpr float kBatteryPanelY = 24.0f;
+constexpr float kBatteryBodyX = kBatteryPanelX + 126.0f;
+constexpr float kBatteryBodyY = kBatteryPanelY + 11.0f;
+constexpr float kBatteryBodyW = 92.0f;
+constexpr float kBatteryBodyH = 42.0f;
+constexpr float kBatteryFillX = kBatteryBodyX + 7.0f;
+constexpr float kBatteryFillY = kBatteryBodyY + 7.0f;
+constexpr float kBatterySegW = 22.0f;
+constexpr float kBatterySegH = 28.0f;
+constexpr float kBatterySegGap = 3.0f;
+constexpr float kBatterySegX[3] = {
+    kBatteryFillX,
+    kBatteryFillX + kBatterySegW + kBatterySegGap,
+    kBatteryFillX + 2.0f * (kBatterySegW + kBatterySegGap)
+};
+constexpr float kBatteryLabelRight = kBatteryBodyX - 10.0f;
+constexpr float kBatteryLabelY = kBatteryPanelY + 15.0f;
+constexpr float kBatteryLabelSize = 30.0f;
+
+std::uint32_t g_battery_panel_handle = 0;
+std::uint32_t g_battery_body_handle = 0;
+std::uint32_t g_battery_body_red_handle = 0;
+std::uint32_t g_battery_label_handle = 0;
+std::uint32_t g_battery_seg_handle[1][3]{};
+std::uint32_t g_battery_scene_handle = 0;
+bool g_battery_built = false;
+bool g_battery_assets_ready = false;
+const char* g_battery_asset_dir = nullptr;
+bool g_battery_setters_ready = false;
+bool g_battery_api_attempted = false;
+int g_battery_level = -1;
+int g_battery_status = -1;
+bool g_battery_valid = false;
+std::uint64_t g_battery_last_poll_ms = 0;
+int g_battery_poll_failures = 0;
+bool g_battery_raw_logged = false;
+int (*g_battery_get_state)(int, void*) = nullptr;
+
+using BatteryFloatSetter = void (*)(MonoObject*, float);
+using BatteryBoolSetter = void (*)(MonoObject*, bool);
+BatteryFloatSetter g_battery_set_x = nullptr;
+BatteryFloatSetter g_battery_set_y = nullptr;
+BatteryFloatSetter g_battery_set_w = nullptr;
+BatteryFloatSetter g_battery_set_h = nullptr;
+BatteryFloatSetter g_battery_set_opacity = nullptr;
+BatteryFloatSetter g_battery_set_label_x = nullptr;
+BatteryBoolSetter g_battery_set_visible = nullptr;
 
 struct TelemetryDrawGuard {
     explicit TelemetryDrawGuard(std::atomic<bool>& f) : flag(f), owns(!f.exchange(true)) {}
@@ -796,6 +856,7 @@ void remove_and_release_handle(MonoObject* root, std::uint32_t& handle) {
 }
 
 bool set_label_text(MonoObject* label, const char* text);   /* defined below */
+void battery_release_widgets(MonoObject* root);
 
 /* Removing a widget does not visibly erase it on every firmware: on 13.40 the old copy stayed on
  * screen with frozen text. A label with empty text draws nothing, so blank before dropping. */
@@ -822,6 +883,7 @@ void prefbar_remove_rows(MonoObject* root) {
     g_telemetry_layout.valid = false;
     g_telemetry_applied_count = 0;
     g_telemetry_hidden = false;
+    battery_release_widgets(root);
 }
 
 void prefbar_release_rows() {
@@ -833,6 +895,7 @@ void prefbar_release_rows() {
     g_telemetry_layout.valid = false;
     g_telemetry_applied_count = 0;
     g_telemetry_hidden = false;
+    battery_release_widgets(nullptr);
 }
 
 bool refresh_game_scene() {
@@ -1372,6 +1435,361 @@ bool pad_read(pad_state_t* s) {
     return true;
 }
 
+bool battery_write_file(const char* dir, const char* file, const unsigned char* data, unsigned size) {
+    char path[256];
+    std::snprintf(path, sizeof(path), "%s/%s", dir, file);
+    FILE* fp = std::fopen(path, "wb");
+    if (!fp) return false;
+    const bool ok = std::fwrite(data, 1, size, fp) == size;
+    std::fclose(fp);
+    return ok;
+}
+
+bool battery_prepare_assets() {
+    if (g_battery_assets_ready) return true;
+    const char* dirs[] = {"/Temp", "/system_tmp"};
+    for (const char* dir : dirs) {
+        bool ok = true;
+        for (int i = 0; i < BATTERY_PNG_COUNT; ++i) {
+            if (!battery_write_file(dir, battery_pngs[i].file,
+                                    battery_pngs[i].data, battery_pngs[i].size)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            g_battery_asset_dir = dir;
+            g_battery_assets_ready = true;
+            log_line("battery: assets written to %s", dir);
+            return true;
+        }
+    }
+    log_line("battery: failed to write assets to /Temp or /system_tmp");
+    return false;
+}
+
+const char* battery_asset_uri(const char* file) {
+    static char uri[384];
+    std::snprintf(uri, sizeof(uri), "file://%s/%s",
+                  g_battery_asset_dir ? g_battery_asset_dir : "/Temp", file);
+    return uri;
+}
+
+bool battery_init_setters() {
+    if (g_battery_setters_ready) return true;
+    MonoClass* image_klass = mono_class_from_name_(
+        g_pui_image, "Sce.PlayStation.PUI.UI2", "ImageBox");
+    MonoClass* label_klass = mono_class_from_name_(
+        g_pui_image, "Sce.PlayStation.PUI.UI2", "Label");
+    if (!image_klass || !label_klass) return false;
+
+    auto bind_float = [](MonoClass* klass, const char* name, BatteryFloatSetter& out) {
+        MonoMethod* setter = property_setter(klass, name);
+        out = setter
+            ? reinterpret_cast<BatteryFloatSetter>(mono_compile_method_(setter))
+            : nullptr;
+        return out != nullptr;
+    };
+    bool ok = true;
+    ok &= bind_float(image_klass, "X", g_battery_set_x);
+    ok &= bind_float(image_klass, "Y", g_battery_set_y);
+    ok &= bind_float(image_klass, "Width", g_battery_set_w);
+    ok &= bind_float(image_klass, "Height", g_battery_set_h);
+    (void)bind_float(image_klass, "Opacity", g_battery_set_opacity);
+    (void)bind_float(label_klass, "X", g_battery_set_label_x);
+    MonoMethod* visible = property_setter(image_klass, "Visible");
+    g_battery_set_visible = visible
+        ? reinterpret_cast<BatteryBoolSetter>(mono_compile_method_(visible))
+        : nullptr;
+    ok &= (g_battery_set_visible != nullptr || g_battery_set_opacity != nullptr);
+    if (!ok) {
+        log_line("battery: PUI setter discovery failed");
+        return false;
+    }
+    g_battery_setters_ready = true;
+    return true;
+}
+
+void battery_apply_visible(std::uint32_t handle, bool visible) {
+    MonoObject* target = managed_target(handle);
+    if (!target) return;
+    if (g_battery_set_visible) {
+        g_battery_set_visible(target, visible);
+    } else if (g_battery_set_opacity) {
+        g_battery_set_opacity(target, visible ? 1.0f : 0.0f);
+    }
+}
+
+void battery_apply_rect(std::uint32_t handle, float x, float y, float w, float h) {
+    MonoObject* target = managed_target(handle);
+    if (!target) return;
+    if (g_battery_set_x) g_battery_set_x(target, x);
+    if (g_battery_set_y) g_battery_set_y(target, y);
+    if (g_battery_set_w) g_battery_set_w(target, w);
+    if (g_battery_set_h) g_battery_set_h(target, h);
+}
+
+MonoObject* create_battery_imagebox(
+    const char* name, float x, float y, float w, float h, const char* file) {
+
+    MonoClass* klass = mono_class_from_name_(
+        g_pui_image, "Sce.PlayStation.PUI.UI2", "ImageBox");
+    if (!klass || !battery_prepare_assets()) return nullptr;
+
+    MonoObject* box = mono_object_new_(g_domain, klass);
+    if (!box) return nullptr;
+    mono_runtime_object_init_(box);
+
+    (void)set_property_direct(klass, box, "Name", mono_string_new_(g_domain, name));
+    (void)set_property_direct(klass, box, "X", x);
+    (void)set_property_direct(klass, box, "Y", y);
+    (void)set_property_direct(klass, box, "Width", w);
+    (void)set_property_direct(klass, box, "Height", h);
+    if (g_battery_set_opacity) g_battery_set_opacity(box, 1.0f);
+
+    MonoMethod* load = mono_class_get_method_from_name_(klass, "LoadAsync", 1);
+    if (!load) return nullptr;
+    void* args[1] = {mono_string_new_(g_domain, battery_asset_uri(file))};
+    MonoObject* exception = nullptr;
+    mono_runtime_invoke_(load, box, args, &exception);
+    return box;
+}
+
+void battery_release_widgets(MonoObject* root) {
+    MonoObject* label = managed_target(g_battery_label_handle);
+    if (label) set_label_text(label, "");
+    remove_and_release_handle(root, g_battery_panel_handle);
+    remove_and_release_handle(root, g_battery_body_handle);
+    remove_and_release_handle(root, g_battery_body_red_handle);
+    remove_and_release_handle(root, g_battery_label_handle);
+    for (auto& color : g_battery_seg_handle)
+        for (auto& h : color) remove_and_release_handle(root, h);
+    g_battery_built = false;
+    g_battery_scene_handle = 0;
+}
+
+bool battery_build_widgets(MonoObject* root) {
+    if (!g_pui_image || !g_domain || !root) return false;
+    if (!battery_init_setters()) return false;
+
+    MonoObject* font = create_font(static_cast<int>(kBatteryLabelSize));
+    if (!font) {
+        log_line("battery: UIFont create failed");
+        return false;
+    }
+
+    MonoObject* panel = create_battery_imagebox(
+        kBatteryPanelId, kBatteryPanelX, kBatteryPanelY, 236.0f, 64.0f, "panel.png");
+    if (!panel || !append_child(root, panel) ||
+        !replace_managed_handle(g_battery_panel_handle, panel)) {
+        log_line("battery: panel create failed");
+        return false;
+    }
+
+    for (int c = 0; c < 1; ++c) {
+        char file[32];
+        std::snprintf(file, sizeof(file), "seg_%s.png", kBatterySegColor[c]);
+        for (int seg = 0; seg < 3; ++seg) {
+            char name[64];
+            std::snprintf(name, sizeof(name),
+                          "id_prefbar_battery_seg_%s_%d", kBatterySegColor[c], seg);
+            MonoObject* box = create_battery_imagebox(
+                name, kBatterySegX[seg], kBatteryFillY, kBatterySegW, kBatterySegH, file);
+            if (box && append_child(root, box) &&
+                replace_managed_handle(g_battery_seg_handle[c][seg], box)) {
+                battery_apply_visible(g_battery_seg_handle[c][seg], false);
+            }
+        }
+    }
+
+    MonoObject* body = create_battery_imagebox(
+        kBatteryBodyId, kBatteryBodyX, kBatteryBodyY, kBatteryBodyW, kBatteryBodyH, "body.png");
+    if (!body || !append_child(root, body) ||
+        !replace_managed_handle(g_battery_body_handle, body)) {
+        log_line("battery: body create failed");
+        return false;
+    }
+
+    MonoObject* body_red = create_battery_imagebox(
+        kBatteryBodyRedId, kBatteryBodyX, kBatteryBodyY, kBatteryBodyW, kBatteryBodyH, "body_red.png");
+    if (!body_red || !append_child(root, body_red) ||
+        !replace_managed_handle(g_battery_body_red_handle, body_red)) {
+        log_line("battery: red warning body create failed");
+        return false;
+    }
+    battery_apply_visible(g_battery_body_red_handle, false);
+
+    MonoObject* label = create_label(
+        kBatteryLabelId, kBatteryLabelRight - 94.0f, kBatteryLabelY, "--%",
+        font, 0, 1.0f, 1.0f, 1.0f, 1.0f);
+    if (!label || !append_child(root, label) ||
+        !replace_managed_handle(g_battery_label_handle, label)) {
+        log_line("battery: label create failed");
+        return false;
+    }
+
+    log_line("battery: widgets created dir=%s", g_battery_asset_dir ? g_battery_asset_dir : "?");
+    return true;
+}
+
+void battery_resolve_api() {
+    if (g_battery_api_attempted) return;
+    g_battery_api_attempted = true;
+
+    if (!sceHidControlGetBatteryState) {
+        log_line("battery: HidControl symbol unavailable");
+        return;
+    }
+
+    g_battery_get_state = sceHidControlGetBatteryState;
+    log_line("battery: HidControl resolved fn=%p", (void*)g_battery_get_state);
+}
+
+void battery_poll() {
+    const std::uint64_t now = prefbar_now_ms();
+    if (g_battery_last_poll_ms != 0 && now - g_battery_last_poll_ms < 1000) return;
+    g_battery_last_poll_ms = now;
+    battery_resolve_api();
+
+    if (!g_battery_get_state) {
+        g_battery_valid = false;
+        return;
+    }
+
+    pad_state_t pad{};
+    if (!pad_read(&pad) || !pad.valid || g_pad_handle < 0) {
+        if (++g_battery_poll_failures >= 3) g_battery_valid = false;
+        return;
+    }
+
+    unsigned int device_id = 0;
+    const int id_rc = scePadGetDeviceId(g_pad_handle, &device_id);
+    if (id_rc < 0) {
+        if (++g_battery_poll_failures >= 3) g_battery_valid = false;
+        static int id_logged = 0;
+        if (++id_logged <= 5)
+            log_line("battery: getDeviceId failed rc=0x%x handle=0x%x", id_rc, g_pad_handle);
+        return;
+    }
+
+    unsigned char raw[32];
+    std::memset(raw, 0, sizeof(raw));
+    const int st_rc = g_battery_get_state(device_id, raw);
+    if (st_rc < 0) {
+        if (++g_battery_poll_failures >= 3) g_battery_valid = false;
+        static int st_logged = 0;
+        if (++st_logged <= 5)
+            log_line("battery: getBatteryState failed rc=0x%x device=0x%x", st_rc, device_id);
+        return;
+    }
+
+    int status = raw[0];
+    int level = raw[1];
+
+    std::uint32_t status32 = 0;
+    std::uint32_t level32 = 0;
+    std::memcpy(&status32, raw + 0, 4);
+    std::memcpy(&level32, raw + 4, 4);
+    std::uint16_t status16 = 0;
+    std::uint16_t level16 = 0;
+    std::memcpy(&status16, raw + 0, 2);
+    std::memcpy(&level16, raw + 2, 2);
+
+    /* SceHidBatteryState on current firmware is two uint32_t fields
+     * (status, level). Older layouts used 8/16-bit fields, so accept the
+     * first layout whose level is in range instead of only falling back
+     * when the byte at raw[1] is out of range. */
+    if (level32 <= 100) {
+        status = static_cast<int>(status32);
+        level = static_cast<int>(level32);
+    } else if (level16 <= 100) {
+        status = status16;
+        level = level16;
+    } else if (raw[1] <= 100) {
+        status = raw[0];
+        level = raw[1];
+    } else if (raw[0] <= 100) {
+        level = raw[0];
+        status = raw[1];
+    }
+
+    if (!g_battery_raw_logged) {
+        g_battery_raw_logged = true;
+        log_line("battery raw rc=0x%x device=0x%x bytes=%02x %02x %02x %02x %02x %02x %02x %02x level=%d status=%d",
+                 st_rc, device_id, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                 level, status);
+    }
+
+    if (level < 0 || level > 100) {
+        if (++g_battery_poll_failures >= 3) g_battery_valid = false;
+        return;
+    }
+
+    g_battery_level = level;
+    g_battery_status = status;
+    g_battery_valid = true;
+    g_battery_poll_failures = 0;
+}
+
+void battery_draw_overlay() {
+    if (!g_runtime_ready.load()) return;
+    battery_poll();
+    if (!refresh_game_scene()) return;
+
+    MonoObject* root = get_root_widget();
+    if (!root) return;
+
+    if (!g_battery_built || g_battery_scene_handle != g_game_scene_handle) {
+        battery_release_widgets(root);
+        if (!battery_build_widgets(root)) return;
+        g_battery_built = true;
+        g_battery_scene_handle = g_game_scene_handle;
+    }
+
+    char text_buf[24];
+    const bool have_level = g_battery_valid && g_battery_level >= 0;
+    if (have_level) {
+        std::snprintf(text_buf, sizeof(text_buf), "%d%%", g_battery_level);
+    } else {
+        std::snprintf(text_buf, sizeof(text_buf), "--%%");
+    }
+
+    MonoObject* label = managed_target(g_battery_label_handle);
+    if (label) {
+        set_label_text(label, text_buf);
+        if (g_battery_set_label_x) {
+            const float width = static_cast<float>(std::strlen(text_buf)) * kBatteryLabelSize * 0.62f;
+            g_battery_set_label_x(label, kBatteryLabelRight - width);
+        }
+    }
+
+    const bool low = have_level && g_battery_level <= 20;
+
+    int bars = 0;
+    if (have_level && !low) {
+        if (g_battery_level > 66) bars = 3;
+        else if (g_battery_level > 33) bars = 2;
+        else if (g_battery_level > 0) bars = 1;
+    }
+    const bool blink_on = low && ((prefbar_now_ms() / 500ULL) % 2ULL) == 0ULL;
+    battery_apply_visible(g_battery_body_handle, !low);
+    battery_apply_visible(g_battery_body_red_handle, blink_on);
+
+    static bool low_warning_logged = false;
+    if (low && !low_warning_logged) {
+        low_warning_logged = true;
+        log_line("battery: low warning level=%d status=%d", g_battery_level, g_battery_status);
+    } else if (!low) {
+        low_warning_logged = false;
+    }
+
+    for (int seg = 0; seg < 3; ++seg) {
+        battery_apply_visible(
+            g_battery_seg_handle[0][seg],
+            have_level && seg < bars);
+    }
+}
+
 /* Read the physical touchpad-click bit from the existing ShellUI pad reader.
  * Three press edges in a 1.5-second window toggle only the text overlay; FPS
  * sampling and the injected renderer stay resident. */
@@ -1413,7 +1831,7 @@ void process_prefbar_toggle_input() {
 
 void application_update_hook(MonoObject* instance) {
     process_prefbar_toggle_input();
-    prefbar_draw_text();
+    battery_draw_overlay();
 
     if (g_application_update_original)
         g_application_update_original(instance);
@@ -1753,7 +2171,7 @@ bool initialize_receiver() {
 
         if (g_background_render_mode) {
             process_prefbar_toggle_input();
-            prefbar_draw_text();
+            battery_draw_overlay();
         }
     }
 }

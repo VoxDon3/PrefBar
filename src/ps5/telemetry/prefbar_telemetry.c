@@ -101,7 +101,7 @@ static uint64_t now_ns(void)
  * toasts per run, so a fault loop can never bury the screen in notifications.
  * Safe to call from the controller thread and the sampler thread at once.
  */
-#define PREFBAR_VERSION "0.2.1"
+#define PREFBAR_VERSION "1.0.1"
 
 #define DBG_ERR 1
 #define DBG_WARN 2
@@ -306,7 +306,7 @@ static void migrate_config_options(void)
 static void ensure_default_config_file(void)
 {
     static const char defaults[] =
-        "# PrefBar 0.2.1 configuration\n"
+        "# PrefBar 1.0.1 configuration\n"
         "# Values are reloaded once when a new game session starts.\n"
         "# Boolean values: 0 = off, 1 = on. Invalid values use defaults.\n\n"
         "[notifications]\n"
