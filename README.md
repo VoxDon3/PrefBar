@@ -2,97 +2,61 @@
   <img src="Docs/logo.png" alt="PrefBar Logo" width="90%" height="120">
 </p>
 
-[![GitHub downloads](https://img.shields.io/github/downloads/X1NONs/PrefBar/total?style=for-the-badge)](https://github.com/X1NONs/PrefBar/releases)
+[![GitHub downloads](https://img.shields.io/github/downloads/VoxDon3/PrefBar/total?style=for-the-badge)](https://github.com/VoxDon3/PrefBar/releases)
 
 **Version 1.0.1**
 
-A standalone on-screen performance overlay for jailbroken PlayStation 5 consoles. PrefBar displays live performance and system telemetry directly over your games, without requiring a separate renderer payload.
+PrefBar is a standalone on-screen battery overlay for jailbroken PlayStation 5 consoles. It reads the DualSense battery level and draws a compact battery panel over the running game, without requiring a separate renderer payload.
 
-## Why This Exists
+![PrefBar battery overlay preview](Docs/battery-preview.png)
+![PrefBar low battery preview](Docs/battery-preview-low.png)
 
-The built-in performance bars available in some PS5 homebrew setups can conflict with other kernel-level components or payloads, such as kstuff and etaHEN. PrefBar was created as an independent alternative: a standalone payload with its own ShellUI renderer, designed to provide in-game telemetry without depending on another payload for rendering.
-
-![PrefBar overlay in action](Docs/image3.png)
-![PrefBar overlay in action](Docs/image1.png)
-> Want yours to get displayed? Check out [Screenshot Discussion](https://github.com/X1NONs/PrefBar/discussions/13).
+> These are preview images. The actual panel position and appearance depend on the game scene and firmware.
 
 ## Features
 
-- **Frame performance:** FPS, average frametime, and 1% lows.
-- **CPU and temperatures:** CPU utilization and temperature, plus SoC temperature when the relevant system interfaces are available.
-- **Fan telemetry:** Fan-duty percentage. This is not an RPM reading.
-- **Memory:** RAM and VRAM usage when the relevant system interfaces are available.
-- **SoC power:** APU power consumption displayed in watts when the relevant kernel API is available.
-- **Horizontal overlay:** Display all enabled metrics in one horizontal bar, with automatic font-size adjustment to fit the screen.
-- **Compact metric rows:** Disabled or unavailable metrics are automatically skipped instead of leaving blank spaces.
+- **DualSense battery percentage:** Reads the controller battery level through `libSceHidControl`.
+- **Three-segment gauge:** Neon-blue segments show the remaining charge at a glance.
+- **Low-battery warning:** At 20% or lower, the normal battery body is replaced by a blinking red outline.
 - **Standalone payload:** The controller and ShellUI renderer are packaged into one combined ELF.
-- **Customizable overlay:** Change text color, font size, shadow, screen position, corner, layout, visibility, and which metric rows are displayed.
-- **Automatic configuration reload:** Settings are reloaded when a new game session starts, without restarting PrefBar.
-- **Quick toggle:** Triple-click the DualSense touchpad to show or hide the overlay. This can be disabled in the configuration.
+- **On-demand module loading:** The controller loads `libSceHidControl.sprx` only when it is not already present.
+- **Touchpad toggle:** Triple-click the DualSense touchpad to show or hide the overlay.
+- **Local-only overlay:** No network connection is used by the renderer.
 
 ## How to use it
 
-1. Download `PrefBar-complete_V1.0.1.elf` from [GitHub Releases](https://github.com/X1NONs/PrefBar/releases/tag/v1.0.1).
+1. Download `PrefBar-complete_V1.0.1.elf` from [GitHub Releases](https://github.com/VoxDon3/PrefBar/releases/tag/v1.0.1).
 2. Load the combined ELF on your jailbroken PS5 using your usual payload loader.
-3. Start a game. PrefBar waits for the game and ShellUI to be ready; allow a few seconds for initialization. The overlay normally appears in the top-left corner.
-4. Triple-click the DualSense touchpad to toggle the overlay on or off. It is enabled by default.
+3. Start a game. PrefBar waits for ShellUI and the game process to be ready; allow a few seconds for initialization.
+4. Triple-click the DualSense touchpad to toggle the battery overlay on or off.
 
-## Customization and colors
+## How it works
 
-PrefBar reads its runtime settings from:
+1. **Controller startup:** The combined ELF starts the controller, creates `/data/prefbar`, and starts the telemetry worker.
+2. **Readiness gates:** The controller waits for stable ShellUI and game-process observations before touching ShellUI.
+3. **Renderer injection:** The ShellUI renderer ELF is embedded inside the controller ELF. The controller injects it into SceShellUI and the renderer attaches to the PUI Mono UI.
+4. **Battery polling:** Once per second, the renderer resolves the DualSense device ID with `scePadGetDeviceId`, then calls `sceHidControlGetBatteryState`. The battery state parser accepts 32-bit, 16-bit, and 8-bit field layouts used by different firmware versions.
+5. **Drawing:** The panel, battery body, and segment textures are embedded in the ELF and written to `/Temp` or `/system_tmp` at runtime. PUI `ImageBox` widgets draw the panel and `Label` draws the percentage.
+6. **Low-battery mode:** Above 20%, the blue segments show three bars above 66%, two bars above 33%, and one bar above 0%. At 20% or lower, the normal body is hidden and `body_red.png` blinks every 500 ms.
+7. **Toggle path:** Three touchpad press edges within 1.5 seconds send a local control message to the controller, which flips the overlay visibility flag.
+
+## Configuration and logs
+
+The controller still creates `/data/prefbar/prefbar.conf`. Set `touchpad_toggle=0` to disable the triple-click toggle. The 1.0.1 battery renderer does not use the legacy performance text-color, font, or metric-row options.
+
+Useful logs:
 
 ```text
-/data/prefbar/prefbar.conf
+/data/prefbar/controller.log
+/data/prefbar/debug.log
+/system_tmp/prefbar_shellui.log
 ```
-
-The configuration supports overlay visibility, text color, text shadow, font size, layout, screen position, and metric-row selection.
-
-You can also enable horizontal layout, SoC power monitoring, control the touchpad toggle, and configure notification and diagnostic options.
-
-Configuration changes are automatically reloaded when a new game session starts. You no longer need to restart PrefBar to apply them after v0.2.1.
-
-### Horizontal overlay
-
-Set `overlay_horizontal=1` in your configuration to display the metrics in one horizontal bar.
-
-PrefBar automatically adjusts the font size when necessary to fit the available screen width.
-
-### Color recommendations
-
-Set the `text_color` value to a six-digit hexadecimal color in `#RRGGBB` format. These are some good starting points:
-
-| Color | Sample | Hex value |
-|---|:---:|---|
-| **Aqua recommended** | ![Aqua](https://img.shields.io/badge/-%20-00E5FF?style=flat-square) | `#00E5FF` |
-| Cyan | ![Cyan](https://img.shields.io/badge/-%20-00FFFF?style=flat-square) | `#00FFFF` |
-| Ice blue | ![Ice blue](https://img.shields.io/badge/-%20-8BE9FD?style=flat-square) | `#8BE9FD` |
-| Green | ![Green](https://img.shields.io/badge/-%20-4ADE80?style=flat-square) | `#4ADE80` |
-| Amber | ![Amber](https://img.shields.io/badge/-%20-FBBF24?style=flat-square) | `#FBBF24` |
-| White default | ![White](https://img.shields.io/badge/-%20-F2F2F2?style=flat-square) | `#F2F2F2` |
-
-**Recommended starting point:**
-
-```ini
-text_color=#00E5FF
-text_shadow=1
-overlay_horizontal=1
-```
-
-The shadow helps keep bright text readable over different game scenes. The color palette is only a set of suggestions; use whichever color is easiest to read in your game.
-
-For the full `.conf` setting list, accepted values, and a complete example, see [HOW_IT_WORKS.md — Runtime configuration](Docs/HOW_IT_WORKS.md#runtime-configuration).
-
-Existing configuration files are not overwritten. Changes are reloaded when a new game session starts.
-
-## Discussions
-
-Have screenshots, ideas for new features, or suggestions for PrefBar? Share them in [GitHub Discussions](https://github.com/X1NONs/PrefBar/discussions)!
 
 ## Build from source
 
 Want to compile PrefBar yourself? See the [build guide](Docs/BUILD.md) for the PS5 Payload SDK requirements, build commands, output files, optional host tests, and cleanup instructions.
 
-For architecture details, runtime behavior, and configuration internals, see [HOW_IT_WORKS.md](Docs/HOW_IT_WORKS.md).
+For architecture details and the legacy telemetry pipeline, see [HOW_IT_WORKS.md](Docs/HOW_IT_WORKS.md).
 
 ## Support
 
@@ -106,7 +70,7 @@ PrefBar is free software under GPL-3.0 and will stay free. If it's useful to you
 | SOL | `2qJYqm3pnX1jFtcG5zKtoh8KTuXE7iqqwNxCLFy2oFk3` |
 | TRX (TRC-20) | `TC5BpBP4P8AcXqvYC7RtWyXfL6Xx1QR5ph` |
 
-## Credits & license
+## Credits and license
 
 **License:** GPL-3.0
 

@@ -1,5 +1,7 @@
 # PrefBar 1.0.1: how it works
 
+> **1.0.1 note:** This release ships a battery-only ShellUI renderer. The renderer no longer draws the legacy performance rows. The telemetry sections below document the controller, the embedded worker, and the legacy performance pipeline that remains in the source tree.
+
 This document describes the implementation present in the repository. It is not a feature roadmap and does not claim that every firmware path has been tested.
 
 ## Build model
